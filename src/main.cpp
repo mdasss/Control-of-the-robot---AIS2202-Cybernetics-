@@ -47,13 +47,15 @@ float err_int_sh = 0;
 
 int cmd_prev = 0;          // last PWM command
 int cmd_prev_sh = 0;
-const int PWM_slew = 8;  // max change per control loop,  tune 3–10., 5 worked best so
+const int PWM_slew = 5;  // max change per control loop,  tune 3–10., 5 worked best so
 bool motorsPaused = false;
 
 unsigned long lastPrint = 0;
 const unsigned long printInterval = 200; // max pause time for printing of the angles
-int n = 0;
+int n_w = 0;
+int n_sh = 0;
 float prev_deg_w = 0.0f;
+float prev_deg_sh = 0.0f;
 
 
 void setup() {
@@ -113,6 +115,8 @@ void setup() {
     Serial.print("I2C Address: 0x");
     Serial.println(ASL_shoulder.getAddress(), HEX);
 
+    prev_deg_w = ASL.rawAngle();
+    prev_deg_sh = ASL_shoulder.rawAngle();
 
     // normalize the target to be within [0,360) degrees //
     while (Target_Deg >= 360.0) Target_Deg -= 360.0;
@@ -130,20 +134,40 @@ void loop() {
 
     // Read AS5600 angle
     //float angle_deg = ASL.readAngle(); shittt
-    float raw_deg = ASL.readAngle(); //* AS5600_RAW_TO_DEGREES; // just used for debuging
-    float raw_deg_sh = ASL_shoulder.rawAngle() * AS5600_RAW_TO_DEGREES;
+    float raw_deg = ASL.rawAngle(); //* AS5600_RAW_TO_DEGREES; // just used for debuging
+    float raw_deg_sh = ASL_shoulder.rawAngle();
     unsigned long currentMillis = millis();
 
 
-    raw_deg += n * 4096;
+    raw_deg += n_w * 4096;
     if (raw_deg < prev_deg_w) {  // add direction,
-        n++;
-        Serial.println(n);
-        if (n == 4) {
-            n = 0;
+        n_w++;
+        Serial.println(n_w);
+        if (n_w == 4) {
+            n_w = 0;
             prev_deg_w = 0;
         }
     }
+
+    /*
+    if (raw_deg_sh < prev_deg_sh - 2048) n_sh++;
+    else if (raw_deg_sh > prev_deg_sh + 2048) n_sh--;
+
+    prev_deg_sh = raw_deg_sh;
+
+
+    raw_deg += n_w * 4096;
+    if (raw_deg < prev_deg_w) {
+        n_w++;
+        if (n_w == 4) n_w = 0; prev_deg_w = 0;
+    }
+    else if (raw_deg > prev_deg_w) {
+        n_w--;
+        if (n_w == -4) n_w = 0; prev_deg_w = 0;
+    }
+    prev_deg_w = raw_deg;
+*/
+
 
     /*
     // bbbb: if paused, just keep motors off and skip control
@@ -174,27 +198,28 @@ void loop() {
         String s = Serial.readStringUntil('\n');
         s.trim();  // remove spaces/newlines
 
-        if (s.length() == 0) return; // ignore empty input
+        if (s.length()){ // ignore empty input
 
-        if (s.startsWith("w")) {  // update to take into account the new values,
-            Target_Deg = s.substring(1).toFloat(); // extract the numeric part of the input, 120, 60 and makes into 120.0, 60.0 etc..
-            while (Target_Deg >= 360.0) Target_Deg -= 360.0; // normalize to output to stay within 0 and 360 degrees
-            while (Target_Deg < 0.0) Target_Deg += 360.0;
-            err_int = 0; err_prev = 0; // reset PID
-            Serial.print("New wrist target: ");
-            Serial.println(Target_Deg, 2);
-        }
-        else if (s.startsWith("s")) {
-            target_deg_sh = s.substring(1).toFloat();
-            while (target_deg_sh >= 360.0) target_deg_sh -= 360.0;
-            while (target_deg_sh < 0.0) target_deg_sh += 360.0;
-            err_int_sh = 0; err_prev_sh = 0;
-            Serial.print("New shoulder target: ");
-            Serial.println(target_deg_sh, 2);
-        }
+            if (s.startsWith("w")) {  // update to take into account the new values,
+                Target_Deg = s.substring(1).toFloat(); // extract the numeric part of the input, 120, 60 and makes into 120.0, 60.0 etc..
+                while (Target_Deg >= 360.0) Target_Deg -= 360.0; // normalize to output to stay within 0 and 360 degrees
+                while (Target_Deg < 0.0) Target_Deg += 360.0;
+                err_int = 0; err_prev = 0; // reset PID
+                Serial.print("New wrist target: ");
+                Serial.println(Target_Deg, 2);
+            }
+            else if (s.startsWith("s")) {
+                target_deg_sh = s.substring(1).toFloat();
+                while (target_deg_sh >= 360.0) target_deg_sh -= 360.0;
+                while (target_deg_sh < 0.0) target_deg_sh += 360.0;
+                err_int_sh = 0; err_prev_sh = 0;
+                Serial.print("New shoulder target: ");
+                Serial.println(target_deg_sh, 2);
+            }
 
-        else {
-            Serial.println("Invalid input. Use w### or s###");
+            else {
+                Serial.println("Invalid input. Use w### or s###");
+            }
         }
     }
 
@@ -205,8 +230,8 @@ void loop() {
     float dt = (now - t0) / 1000.0;  // seconds
     t0 = now;
 
-    float angle = ASL.rawAngle() * AS5600_RAW_TO_DEGREES; //reads new values from sensor
-    float angle_sh = ASL_shoulder.rawAngle() * AS5600_RAW_TO_DEGREES;
+    float angle = (raw_deg + 4096*n_w) *  AS5600_RAW_TO_DEGREES; //reads new values from sensor
+    float angle_sh =(raw_deg_sh + 4096*n_sh) * AS5600_RAW_TO_DEGREES;
 
     // the shortst error  [-180..+180]
     float e = Target_Deg - angle; // error between the target angle and the current
@@ -316,6 +341,7 @@ void loop() {
         lastPrint = currentMillis;
         Serial.print("\tRaw for the wrist: ");
         Serial.println(raw_deg);
+        Serial.println(n_w);
         Serial.print("\tRaw for the shoulder: ");
         Serial.println(raw_deg_sh);
         Serial.println(cmd);
@@ -341,9 +367,10 @@ void loop() {
         digitalWrite(InB_pin_sh, HIGH);
         analogWrite(PWM_pin_sh, -cmd_sh);
     }
-    prev_deg_w = raw_deg;
+
 
 }
+
 
 
 // the robot is moving after it loses connection with arduino, why? if the angle is equal target deg!
