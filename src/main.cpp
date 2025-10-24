@@ -9,7 +9,7 @@ AS5600 ASL_shoulder;
 TwoWire Wire_shoulder = TwoWire(1); // second bus for the shoulder encoder
 
 // Pin definitions wrist
-const int Single_channel_pin = 21;  // STBY / Single-channel enable
+const int Single_channel_pin = 26; // STBY / Single-channel enable, 21 before
 const int InA_pin = 33;  // INA1
 const int InB_pin = 25;  // INA2
 const int PWM_pin = 32;  // PWMA
@@ -28,7 +28,7 @@ const int SCL_pin_sh = 19;
 const int SDA_pin_sh = 18;
 
 // PID and target
-float  Target_Deg = 90; // change! overwrites the actual position after the serial monitor has been turned off
+float  Target_Deg = 0; // change! overwrites the actual position after the serial monitor has been turned off
 float target_deg_sh = 8; // this one too
 float Kp = 3, Ki = 0.2, Kd = 0.4; // might be necessary to use some other values for the constants of the second PID
 
@@ -52,11 +52,17 @@ bool motorsPaused = false;
 
 unsigned long lastPrint = 0;
 const unsigned long printInterval = 200; // max pause time for printing of the angles
-int n_w = 0;
-int n_sh = 0;
-float prev_deg_w = 0.0f;
-float prev_deg_sh = 0.0f;
 
+// ---- NEW wrap system state ----
+int turns_w = 0, turns_sh = 0;                 // multi-turn counters
+uint16_t prev_raw_w = 0, prev_raw_sh = 0;      // previous raw samples (0..4095)
+constexpr float RAW2DEG = 360.0f/4096.0f;      // raw counts -> degrees
+
+// ---- Gear ratios (sensor/motor turns per 1 output turn) ----
+const float GEAR_W  = 4.0f;   // wrist (set to your actual ratio)
+const float GEAR_SH = 4.0f;   // shoulder (change if different)
+
+// -------------------------------
 
 void setup() {
     Serial.begin(115200);
@@ -115,8 +121,8 @@ void setup() {
     Serial.print("I2C Address: 0x");
     Serial.println(ASL_shoulder.getAddress(), HEX);
 
-    prev_deg_w = ASL.rawAngle();
-    prev_deg_sh = ASL_shoulder.rawAngle();
+    prev_raw_w  = ASL.rawAngle();
+    prev_raw_sh = ASL_shoulder.rawAngle();
 
     // normalize the target to be within [0,360) degrees //
     while (Target_Deg >= 360.0) Target_Deg -= 360.0;
@@ -138,16 +144,38 @@ void loop() {
     float raw_deg_sh = ASL_shoulder.rawAngle();
     unsigned long currentMillis = millis();
 
+    // ----- NEW wrap/unwrap -----
+    // update multi-turn counters using wrap detection (half-scale threshold = 2048)
+    int dw = (int)raw_deg - (int)prev_raw_w;
+    if (dw < -2048)      turns_w++;   // wrapped forward (359->0)
+    else if (dw > 2048)  turns_w--;   // wrapped backward (0->359)
+    prev_raw_w = (uint16_t)raw_deg;
 
-    raw_deg += n_w * 4096;
-    if (raw_deg < prev_deg_w) {  // add direction,
-        n_w++;
-        Serial.println(n_w);
-        if (n_w == 4) {
-            n_w = 0;
-            prev_deg_w = 0;
-        }
-    }
+    int dsh = (int)raw_deg_sh - (int)prev_raw_sh;
+    if (dsh < -2048)      turns_sh++;
+    else if (dsh > 2048)  turns_sh--;
+    prev_raw_sh = (uint16_t)raw_deg_sh;
+
+    // absolute unwrapped angles in degrees (sensor space)
+    float angle_w_deg  = (turns_w  * 4096 + (int)raw_deg)    * RAW2DEG;
+    float angle_sh_deg = (turns_sh * 4096 + (int)raw_deg_sh) * RAW2DEG;
+
+    // reduce measured angles to [0..360) in **output space** by dividing by gear ratio
+    auto mod360 = [](float a){
+      a = fmodf(a, 360.0f);
+      if (a < 0) a += 360.0f;
+      return a;
+    };
+    float meas_w_mod  = mod360(angle_w_deg  / GEAR_W);   // << scale feedback
+    float meas_sh_mod = mod360(angle_sh_deg / GEAR_SH);  // << scale feedback
+
+    // shortest-path helper (−180..+180)
+    auto wrapTo180 = [](float x){
+      while (x > 180.0f)   x -= 360.0f;
+      while (x <= -180.0f) x += 360.0f;
+      return x;
+    };
+    // ---------------------------
 
     /*
     if (raw_deg_sh < prev_deg_sh - 2048) n_sh++;
@@ -230,12 +258,16 @@ void loop() {
     float dt = (now - t0) / 1000.0;  // seconds
     t0 = now;
 
-    float angle = (raw_deg + 4096*n_w) *  AS5600_RAW_TO_DEGREES; //reads new values from sensor
-    float angle_sh =(raw_deg_sh + 4096*n_sh) * AS5600_RAW_TO_DEGREES;
+    // --- error in OUTPUT space (targets are already in output degrees) ---
+    // float angle = (raw_deg + 4096*n_w) *  AS5600_RAW_TO_DEGREES; //reads new values from sensor
+    // float angle_sh =(raw_deg_sh + 4096*n_sh) * AS5600_RAW_TO_DEGREES;
 
     // the shortst error  [-180..+180]
-    float e = Target_Deg - angle; // error between the target angle and the current
-    float e_sh = target_deg_sh - angle_sh;
+    // float e = Target_Deg - angle; // error between the target angle and the current
+    // float e_sh = target_deg_sh - angle_sh;
+
+    float e    = wrapTo180(Target_Deg    - meas_w_mod);
+    float e_sh = wrapTo180(target_deg_sh - meas_sh_mod);
 
     /*
     if (e > 180.0)  e -= 360.0; // wraps the error by mapping it into -180 to + 180 degrees, to find the shortest path to the target value
@@ -282,7 +314,6 @@ void loop() {
 
     err_prev = e;
     err_prev_sh = e_sh;
-
 
     float u = Kp*e + Ki*err_int + Kd*de;       // pos one direction, neg the other
     float u_sh = Kp * e_sh + Ki *err_int_sh + Kd*de_sh;
@@ -341,9 +372,16 @@ void loop() {
         lastPrint = currentMillis;
         Serial.print("\tRaw for the wrist: ");
         Serial.println(raw_deg);
-        Serial.println(n_w);
+        Serial.print("\tTurns_w: ");
+        Serial.println(turns_w);
         Serial.print("\tRaw for the shoulder: ");
         Serial.println(raw_deg_sh);
+        Serial.print("\tTurns_sh: ");
+        Serial.println(turns_sh);
+        Serial.print("\tW meas(out): ");
+        Serial.println(meas_w_mod);
+        Serial.print("\tS meas(out): ");
+        Serial.println(meas_sh_mod);
         Serial.println(cmd);
         Serial.println(cmd_sh);
     }
@@ -367,10 +405,6 @@ void loop() {
         digitalWrite(InB_pin_sh, HIGH);
         analogWrite(PWM_pin_sh, -cmd_sh);
     }
-
-
 }
-
-
 
 // the robot is moving after it loses connection with arduino, why? if the angle is equal target deg!
